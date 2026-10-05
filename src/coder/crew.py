@@ -16,8 +16,16 @@ class Coder():
         self.allow_code_execution = allow_code_execution
 
     def _llm(self) -> LLM:
-        model = os.getenv('MODEL') or self.agents_config['coder']['llm']
-        return LLM(model=model)
+        api_key = os.getenv('GEMINI_API_KEY', '').strip()
+        if not api_key:
+            raise RuntimeError('GEMINI_API_KEY is not configured.')
+        return LLM(
+            model=self.agents_config['coder']['llm'],
+            api_key=api_key,
+            timeout=30,
+            max_tokens=1024,
+            num_retries=0,
+        )
 
     # One click install for Docker Desktop:
     #https://docs.docker.com/desktop/
@@ -30,8 +38,8 @@ class Coder():
             verbose=True,
             allow_code_execution=self.allow_code_execution,
             code_execution_mode="safe",  # Uses Docker for safety
-            max_execution_time=120, 
-            max_retry_limit=3, 
+            max_execution_time=60,
+            max_retry_limit=0,
             allow_dangerous_code=False,
     )
 

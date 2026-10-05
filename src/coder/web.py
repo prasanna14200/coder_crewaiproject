@@ -1,11 +1,14 @@
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from litellm import RateLimitError
 from pydantic import BaseModel, Field
 
 from coder.crew import Coder
@@ -17,29 +20,59 @@ executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="coding-task")
 jobs: dict[str, dict[str, str]] = {}
 jobs_lock = threading.Lock()
 active_job: str | None = None
+daily_job_date = None
+daily_job_count = 0
+MAX_DAILY_JOBS = 10
+MAX_RATE_LIMIT_RETRIES = 2
+
+
+def _exception_chain(error: Exception):
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+
+
+def _is_rate_limited(error: Exception) -> bool:
+    for current in _exception_chain(error):
+        status = getattr(current, "status_code", None)
+        response = getattr(current, "response", None)
+        response_status = getattr(response, "status_code", None)
+        message = str(current).lower()
+        if (
+            isinstance(current, RateLimitError)
+            or status == 429
+            or response_status == 429
+            or "resource_exhausted" in message
+        ):
+            return True
+    return False
 
 
 def _failure_detail(error: Exception) -> str:
-  message = str(error).lower()
-  if "model_not_supported" in message or "not supported by any provider" in message:
-    return (
-      "Hugging Face has no enabled Inference Provider for the configured model "
-      "on this account. Enable provider access for the model or set MODEL to "
-      "a Hugging Face model available to your token. See server logs for details."
-    )
-  if "401" in message or "unauthorized" in message or "invalid token" in message:
-    return (
-      "Hugging Face rejected the configured token. Set a valid "
-      "HUGGINGFACE_API_KEY with Inference Providers access in the service environment."
-    )
-  return (
-    "The coding task could not complete with the configured Hugging Face model. "
-    "Check HUGGINGFACE_API_KEY and MODEL in the service environment, then see server logs."
-  )
+    message = " ".join(str(item).lower() for item in _exception_chain(error))
+    if _is_rate_limited(error):
+        return (
+            "Gemini's free-tier rate limit was reached after two retries. "
+            "Wait for the quota reset shown in Google AI Studio. This app does not use paid fallback."
+        )
+    if any(marker in message for marker in ("401", "403", "api_key_invalid", "unauthorized")):
+        return "Gemini rejected the API key or project. Verify GEMINI_API_KEY and that the project remains on the Free tier."
+    if any(marker in message for marker in ("model_not_found", "model not found", "unsupported model")):
+        return "The configured Gemini model is unavailable. This app is pinned to gemini-3.8-flash; check Google AI Studio availability."
+    return "The Gemini request failed. Check GEMINI_API_KEY, Free-tier quota, and the server logs."
 
 
 class CodingRequest(BaseModel):
-    assignment: str = Field(min_length=10, max_length=2000)
+    assignment: str = Field(min_length=10, max_length=1200)
 
 
 PAGE = """<!doctype html>
@@ -87,13 +120,13 @@ PAGE = """<!doctype html>
   </style>
 </head>
 <body>
-  <header><div class="topline"><a class="brand" href="/">Code / CrewAI</a><span class="model">Hugging Face / Llama 3 8B Instruct</span></div></header>
+  <header><div class="topline"><a class="brand" href="/">Code / CrewAI</a><span class="model">Gemini 3.8 Flash / Free tier</span></div></header>
   <main>
     <h1>Turn a coding task into a working draft.</h1>
     <p class="intro">Describe the behavior you need. The coder agent returns code and example checks.</p>
     <form id="coding-form">
       <label for="assignment">Coding task</label>
-      <textarea id="assignment" name="assignment" minlength="10" maxlength="2000" placeholder="Create a Python function that checks whether a string is a palindrome, with example inputs and tests." required></textarea>
+      <textarea id="assignment" name="assignment" minlength="10" maxlength="1200" placeholder="Create a Python program that calculates total, average, and grade for marks 90, 80, 70, 85, 95." required></textarea>
       <div class="form-footer"><span id="status" role="status" aria-live="polite"></span><button id="submit" type="submit">Generate code</button></div>
     </form>
     <p class="notice">Generated code is not executed by this public service. Review it and run it in your own sandbox before use.</p>
@@ -129,7 +162,7 @@ PAGE = """<!doctype html>
           if (!poll.ok) throw new Error(data.detail || 'The task status could not be read.');
           if (data.status === 'completed') break;
           if (data.status === 'failed') throw new Error(data.detail);
-          status.textContent = data.status === 'queued' ? 'Waiting for the coder...' : 'The coder is drafting your solution...';
+          status.textContent = data.status === 'queued' ? 'Waiting for the coder...' : data.status === 'retrying' ? 'Free-tier rate limit reached; retrying within the request limit...' : 'The coder is drafting your solution...';
         }
         document.querySelector('#output').textContent = data.result;
         document.querySelector('#result-meta').textContent = 'Execution not performed';
@@ -167,23 +200,38 @@ def _run_job(job_id: str, assignment: str) -> None:
         f"{assignment}\n\n"
         "Do not execute generated code or claim it was executed. Include the code, "
         "example inputs, and test code in your response. Label any predicted output "
-        "as illustrative rather than executed."
+        "as illustrative rather than executed. Use Python's standard library only "
+        "unless the assignment explicitly asks for other dependencies."
     )
-    try:
-        crew = Coder(allow_code_execution=False).crew()
-        for task in crew.tasks:
-            task.output_file = None
-        result = crew.kickoff(inputs={"assignment": safe_assignment})
-        output = result.raw or "\n\n".join(task.raw for task in result.tasks_output)
-        if not output.strip():
-            raise RuntimeError("The coding agent returned an empty result.")
-        update = {"status": "completed", "result": output}
-    except Exception as error:
-        logger.exception("Coding task failed (job_id=%s)", job_id)
-        update = {
-            "status": "failed",
-            "detail": _failure_detail(error),
-        }
+    update = {"status": "failed", "detail": "Coding task failed; check server logs."}
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            crew = Coder(allow_code_execution=False).crew()
+            for task in crew.tasks:
+                task.output_file = None
+            result = crew.kickoff(inputs={"assignment": safe_assignment})
+            output = result.raw or "\n\n".join(task.raw for task in result.tasks_output)
+            if not output.strip():
+                raise RuntimeError("The coding agent returned an empty result.")
+            update = {"status": "completed", "result": output}
+            break
+        except Exception as error:
+            if _is_rate_limited(error) and attempt < MAX_RATE_LIMIT_RETRIES:
+                delay = 2 ** attempt
+                logger.warning(
+                    "Gemini rate limit for job %s; retry %s/%s in %s seconds",
+                    job_id,
+                    attempt + 1,
+                    MAX_RATE_LIMIT_RETRIES,
+                    delay,
+                )
+                with jobs_lock:
+                    jobs[job_id]["status"] = "retrying"
+                time.sleep(delay)
+                continue
+            logger.exception("Coding task failed (job_id=%s)", job_id)
+            update = {"status": "failed", "detail": _failure_detail(error)}
+            break
 
     with jobs_lock:
         jobs[job_id].update(update)
@@ -192,19 +240,28 @@ def _run_job(job_id: str, assignment: str) -> None:
 
 @app.post("/jobs", status_code=202)
 def create_job(request: CodingRequest) -> dict[str, str]:
-    global active_job
+    global active_job, daily_job_date, daily_job_count
     assignment = request.assignment.strip()
     if len(assignment) < 10:
         raise HTTPException(status_code=422, detail="Describe a coding task using at least 10 characters.")
-    if not os.getenv("HUGGINGFACE_API_KEY", "").strip():
+    if not os.getenv("GEMINI_API_KEY", "").strip():
         raise HTTPException(
             status_code=503,
-            detail="HUGGINGFACE_API_KEY is not configured. Add it to the service environment and redeploy.",
+            detail="GEMINI_API_KEY is not configured. Add it to the service environment and redeploy.",
         )
 
     with jobs_lock:
+        today = datetime.now(timezone.utc).date()
+        if daily_job_date != today:
+            daily_job_date = today
+            daily_job_count = 0
         if active_job is not None:
             raise HTTPException(status_code=409, detail="A coding task is already running. Try again shortly.")
+        if daily_job_count >= MAX_DAILY_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="This app has reached its 10-task daily free-tier budget. Try again after 00:00 UTC.",
+            )
         finished_jobs = [job_id for job_id, job in jobs.items() if job["status"] in {"completed", "failed"}]
         while len(jobs) >= 25 and finished_jobs:
             del jobs[finished_jobs.pop(0)]
@@ -214,6 +271,7 @@ def create_job(request: CodingRequest) -> dict[str, str]:
         job_id = str(uuid4())
         jobs[job_id] = {"status": "queued"}
         active_job = job_id
+        daily_job_count += 1
 
     try:
         executor.submit(_run_job, job_id, assignment)
@@ -221,6 +279,7 @@ def create_job(request: CodingRequest) -> dict[str, str]:
         with jobs_lock:
             jobs.pop(job_id, None)
             active_job = None
+            daily_job_count = max(0, daily_job_count - 1)
         raise HTTPException(status_code=503, detail="The coding task could not be queued.") from error
     return {"job_id": job_id, "status": "queued"}
 
