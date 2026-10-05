@@ -1,4 +1,5 @@
 import unittest
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -50,6 +51,38 @@ class CodingWebTests(unittest.TestCase):
         response = self.client.post("/jobs", json={"assignment": "too short"})
 
         self.assertEqual(response.status_code, 422)
+
+    def test_job_reports_missing_huggingface_key(self):
+        with patch.dict(os.environ, {"HUGGINGFACE_API_KEY": ""}):
+            response = self.client.post(
+                "/jobs",
+                json={"assignment": "Create a Python program for calculating grades."},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("HUGGINGFACE_API_KEY", response.json()["detail"])
+
+    @patch.object(web, "Coder")
+    @patch.object(web, "executor")
+    def test_unsupported_model_returns_safe_provider_guidance(self, executor, coder_class):
+        crew = coder_class.return_value.crew.return_value
+        crew.tasks = [SimpleNamespace(output_file="output/code_and_output.txt")]
+        crew.kickoff.side_effect = RuntimeError(
+            "model_not_supported: private provider response must stay in server logs"
+        )
+        executor.submit.side_effect = lambda function, *args: function(*args)
+
+        with self.assertLogs(web.logger, level="ERROR") as captured:
+            started = self.client.post(
+                "/jobs",
+                json={"assignment": "Create a Python program for calculating grades."},
+            )
+        result = self.client.get(f"/jobs/{started.json()['job_id']}").json()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("no enabled Inference Provider", result["detail"])
+        self.assertNotIn("private provider response", result["detail"])
+        self.assertTrue(any("model_not_supported" in line for line in captured.output))
 
     def test_health_check(self):
         response = self.client.get("/healthz")

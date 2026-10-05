@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
@@ -16,6 +17,25 @@ executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="coding-task")
 jobs: dict[str, dict[str, str]] = {}
 jobs_lock = threading.Lock()
 active_job: str | None = None
+
+
+def _failure_detail(error: Exception) -> str:
+  message = str(error).lower()
+  if "model_not_supported" in message or "not supported by any provider" in message:
+    return (
+      "Hugging Face has no enabled Inference Provider for the configured model "
+      "on this account. Enable provider access for the model or set MODEL to "
+      "a Hugging Face model available to your token. See server logs for details."
+    )
+  if "401" in message or "unauthorized" in message or "invalid token" in message:
+    return (
+      "Hugging Face rejected the configured token. Set a valid "
+      "HUGGINGFACE_API_KEY with Inference Providers access in the service environment."
+    )
+  return (
+    "The coding task could not complete with the configured Hugging Face model. "
+    "Check HUGGINGFACE_API_KEY and MODEL in the service environment, then see server logs."
+  )
 
 
 class CodingRequest(BaseModel):
@@ -158,11 +178,11 @@ def _run_job(job_id: str, assignment: str) -> None:
         if not output.strip():
             raise RuntimeError("The coding agent returned an empty result.")
         update = {"status": "completed", "result": output}
-    except Exception:
-        logger.exception("Coding task failed")
+    except Exception as error:
+        logger.exception("Coding task failed (job_id=%s)", job_id)
         update = {
             "status": "failed",
-            "detail": "Coding task failed. Check the configured model and server logs.",
+            "detail": _failure_detail(error),
         }
 
     with jobs_lock:
@@ -176,6 +196,11 @@ def create_job(request: CodingRequest) -> dict[str, str]:
     assignment = request.assignment.strip()
     if len(assignment) < 10:
         raise HTTPException(status_code=422, detail="Describe a coding task using at least 10 characters.")
+    if not os.getenv("HUGGINGFACE_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="HUGGINGFACE_API_KEY is not configured. Add it to the service environment and redeploy.",
+        )
 
     with jobs_lock:
         if active_job is not None:

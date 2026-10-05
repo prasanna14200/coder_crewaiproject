@@ -4,9 +4,11 @@ This project uses one CrewAI Python developer agent to generate code for a user-
 
 ## Model and configuration
 
-The agent uses `huggingface/meta-llama/Meta-Llama-3-8B-Instruct` as configured in `src/coder/config/agents.yaml`. Set `HUGGINGFACE_API_KEY` to a Hugging Face access token that can use Inference Providers. `MODEL` optionally overrides the model identifier; the application does not switch providers automatically. The custom example tool is not attached to this crew, so `SERPER_API_KEY` is not required. Crew tracing is optional and disabled by default.
+The agent uses `huggingface/meta-llama/Meta-Llama-3-8B-Instruct` as configured in `src/coder/config/agents.yaml`. Set `HUGGINGFACE_API_KEY` to a Hugging Face access token that can use Inference Providers. `MODEL` optionally overrides the LiteLLM model identifier, for example with a Hugging Face model that has an inference provider enabled for your account. The application never switches providers automatically; check a provider's terms/pricing before enabling it.
 
-Copy `.env.example` to `.env` for local development. Keep credentials out of Git. If Hugging Face responds with `401 Unauthorized`, replace the token with a valid Inference Providers token. If it reports `model_not_supported`, enable an inference provider for the selected model or select a Hugging Face model available to your token.
+Copy `.env.example` to `.env` for local development. Keep credentials out of Git. `SERPER_API_KEY` is not required because the example tool is not attached to this crew. `CREWAI_TRACING_ENABLED` is optional and off by default.
+
+The current default model was tested and Hugging Face returned HTTP 400 `model_not_supported` because no inference provider for it is enabled on the tested account. No coding output was generated. To run a real task, either enable an available provider for that model in Hugging Face, or set `MODEL` to a Hugging Face LiteLLM model identifier that your token can use. If a provider would incur charges, review its terms and pricing before enabling it. A `401 Unauthorized` instead means the token is invalid or lacks the required permissions; replace `HUGGINGFACE_API_KEY` with a valid token. The web app shows safe guidance, while server logs retain the traceback for diagnosis.
 
 ## Install and run
 
@@ -50,7 +52,7 @@ Push the project changes to `main`, then create a **Web Service** from `https://
 | Start Command | `uv run --no-sync python -m uvicorn coder.web:app --host 0.0.0.0 --port $PORT` |
 | Health Check Path | `/healthz` |
 
-Set `PYTHON_VERSION=3.11.11` and `HUGGINGFACE_API_KEY` in the Render Environment settings. Get the token from Hugging Face **Settings > Access Tokens** and grant it Inference Providers permissions. Set `MODEL` only if overriding the configured Hugging Face model. Render supplies `PORT`; do not set it yourself. Do not add the key to the repository or build command.
+Set `PYTHON_VERSION=3.11.11` and `HUGGINGFACE_API_KEY` in the Render Environment settings. Get the token from Hugging Face **Settings > Access Tokens** and grant it Inference Providers permissions. Set `MODEL` to an accessible Hugging Face LiteLLM model identifier if the default model is not enabled for your account; do not select a paid provider without reviewing its pricing. Render supplies `PORT`; do not set it yourself. Do not add the key to the repository or build command.
 
 This service calls Hugging Face remotely; it does not load local model weights. The web route disables code execution, so Render does not need Docker. The CrewAI dependency set is substantial and model calls can take time. Use a single paid `1c-2g` instance (1 CPU, 2 GB RAM) for reliable use. Render Free provides 512 MB RAM and 0.1 CPU and spins down after 15 minutes idle; treat it only as a best-effort smoke test. The app serializes jobs in one process; do not scale it to multiple instances without adding shared job storage/queueing. A restart clears active and completed in-memory jobs.
 
