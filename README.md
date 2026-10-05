@@ -1,54 +1,57 @@
-# Coder Crew
+# CrewAI Coder
 
-Welcome to the Coder Crew project, powered by [crewAI](https://crewai.com). This template is designed to help you set up a multi-agent AI system with ease, leveraging the powerful and flexible framework provided by crewAI. Our goal is to enable your agents to collaborate effectively on complex tasks, maximizing their collective intelligence and capabilities.
+This project uses one CrewAI Python developer agent to generate code for a user-supplied assignment. The sequential crew runs the configured `coding_task`; the CLI writes its result to `output/code_and_output.txt`, while the web app returns it as a downloadable response without writing per-request files.
 
-## Installation
+## Model and configuration
 
-Ensure you have Python >=3.10 <3.14 installed on your system. This project uses [UV](https://docs.astral.sh/uv/) for dependency management and package handling, offering a seamless setup and execution experience.
+The agent uses `huggingface/meta-llama/Meta-Llama-3-8B-Instruct` as configured in `src/coder/config/agents.yaml`. Set `HUGGINGFACE_API_KEY` to a Hugging Face access token that can use Inference Providers. `MODEL` optionally overrides the model identifier; the application does not switch providers automatically. The custom example tool is not attached to this crew, so `SERPER_API_KEY` is not required. Crew tracing is optional and disabled by default.
 
-First, if you haven't already, install uv:
+Copy `.env.example` to `.env` for local development. Keep credentials out of Git. If Hugging Face responds with `401 Unauthorized`, replace the token with a valid Inference Providers token. If it reports `model_not_supported`, enable an inference provider for the selected model or select a Hugging Face model available to your token.
 
-```bash
-pip install uv
-```
+## Install and run
 
-Next, navigate to your project directory and install the dependencies:
-
-(Optional) Lock the dependencies and install them by using the CLI command:
-```bash
-crewai install
-```
-### Customizing
-
-**Add your `OPENAI_API_KEY` into the `.env` file**
-
-- Modify `src/coder/config/agents.yaml` to define your agents
-- Modify `src/coder/config/tasks.yaml` to define your tasks
-- Modify `src/coder/crew.py` to add your own logic, tools and specific args
-- Modify `src/coder/main.py` to add custom inputs for your agents and tasks
-
-## Running the Project
-
-To kickstart your crew of AI agents and begin task execution, run this from the root folder of your project:
+Use Python 3.10 through 3.13 and install the locked dependencies in the project virtual environment:
 
 ```bash
-$ crewai run
+uv sync --locked
 ```
 
-This command initializes the coder Crew, assembling the agents and assigning them tasks as defined in your configuration.
+The existing CLI uses CrewAI safe code execution and requires a running Docker daemon. Give it a coding assignment as an argument, or omit the argument to run the original series assignment:
 
-This example, unmodified, will run the create a `report.md` file with the output of a research on LLMs in the root folder.
+```bash
+uv run coder "Create a Python palindrome function with example inputs and tests."
+```
 
-## Understanding Your Crew
+The hosted web application deliberately disables code execution. It shows and downloads the generated result, but does not run it or claim that its example output has been tested. Review generated code and run it in a sandbox you control.
 
-The coder Crew is composed of multiple AI agents, each with unique roles, goals, and tools. These agents collaborate on a series of tasks, defined in `config/tasks.yaml`, leveraging their collective skills to achieve complex objectives. The `config/agents.yaml` file outlines the capabilities and configurations of each agent in your crew.
+Run the web app locally:
 
-## Support
+```bash
+uv run python -m uvicorn coder.web:app --host 0.0.0.0 --port 8000
+```
 
-For support, questions, or feedback regarding the Coder Crew or crewAI.
-- Visit our [documentation](https://docs.crewai.com)
-- Reach out to us through our [GitHub repository](https://github.com/joaomdmoura/crewai)
-- [Join our Discord](https://discord.com/invite/X4JWnZnxPb)
-- [Chat with our docs](https://chatg.pt/DWjSBZn)
+Open `http://localhost:8000`. The app accepts one coding job at a time and polls for the result. Its health endpoint is `/healthz`. Job state is held in memory and is lost when the process restarts.
 
-Let's create wonders together with the power and simplicity of crewAI.
+Run the web-interface tests:
+
+```bash
+uv run --no-sync python -m unittest discover -s tests -v
+```
+
+## Render deployment
+
+Push the project changes to `main`, then create a **Web Service** from `https://github.com/prasanna14200/coder_crewaiproject` on branch `main`.
+
+| Setting | Value |
+| --- | --- |
+| Root Directory | Leave blank |
+| Runtime | Python 3.11 |
+| Build Command | `pip install uv && uv sync --frozen --no-dev` |
+| Start Command | `uv run --no-sync python -m uvicorn coder.web:app --host 0.0.0.0 --port $PORT` |
+| Health Check Path | `/healthz` |
+
+Set `PYTHON_VERSION=3.11.11` and `HUGGINGFACE_API_KEY` in the Render Environment settings. Get the token from Hugging Face **Settings > Access Tokens** and grant it Inference Providers permissions. Set `MODEL` only if overriding the configured Hugging Face model. Render supplies `PORT`; do not set it yourself. Do not add the key to the repository or build command.
+
+This service calls Hugging Face remotely; it does not load local model weights. The web route disables code execution, so Render does not need Docker. The CrewAI dependency set is substantial and model calls can take time. Use a single paid `1c-2g` instance (1 CPU, 2 GB RAM) for reliable use. Render Free provides 512 MB RAM and 0.1 CPU and spins down after 15 minutes idle; treat it only as a best-effort smoke test. The app serializes jobs in one process; do not scale it to multiple instances without adding shared job storage/queueing. A restart clears active and completed in-memory jobs.
+
+After deployment, verify `/healthz` returns `{"status":"ok"}`, submit a coding task, wait for the generated result, and test the download link. A successful health check does not verify Hugging Face access; a completed coding task does.

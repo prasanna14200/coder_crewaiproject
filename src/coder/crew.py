@@ -1,4 +1,6 @@
-from crewai import Agent, Crew, Process, Task
+import os
+
+from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 
 
@@ -10,6 +12,13 @@ class Coder():
     agents_config = 'config/agents.yaml'
     tasks_config = 'config/tasks.yaml'
 
+    def __init__(self, *, allow_code_execution: bool = True):
+        self.allow_code_execution = allow_code_execution
+
+    def _llm(self) -> LLM:
+        model = os.getenv('MODEL') or self.agents_config['coder']['llm']
+        return LLM(model=model)
+
     # One click install for Docker Desktop:
     #https://docs.docker.com/desktop/
 
@@ -17,8 +26,9 @@ class Coder():
     def coder(self) -> Agent:
         return Agent(
             config=self.agents_config['coder'],
+            llm=self._llm(),
             verbose=True,
-            allow_code_execution=True,
+            allow_code_execution=self.allow_code_execution,
             code_execution_mode="safe",  # Uses Docker for safety
             max_execution_time=120, 
             max_retry_limit=3, 
